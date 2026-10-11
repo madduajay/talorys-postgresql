@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Generate isolated local credentials
+        run: npm run setup:local
+      - name: Start disposable PostgreSQL
+        run: |
+          docker compose up -d --wait postgres
+          docker compose exec -T postgres createdb -U talorys talorys_test
+          docker compose exec -T postgres createdb -U talorys talorys_e2e
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+      - run: npm run test:pack
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+      - name: Remove disposable PostgreSQL
+        if: always()
+        run: docker compose down -v

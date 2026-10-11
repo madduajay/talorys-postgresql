@@ -1,0 +1,143 @@
+import { type ChatStreamEvent, chatRequestSchema, conversationCreateSchema, conversationUpdateSchema } from "@talorys/shared";
+import { Hono } from "hono";
+import { z } from "zod";
+import type { AppEnv } from "../app";
+import { body, query } from "../middleware";
+import { AppError, NotFoundError } from "../errors";
+import { ALL_TOOLS, runApprovedAction } from "../../tools";
+
+export const chatRoutes = new Hono<AppEnv>();
+
+chatRoutes.get("/conversations", async (c) => {
+  const { q } = query(c, z.object({ q: z.string().max(200).optional() }));
+  return c.json({ conversations: (await c.env.agent.services.conversations.list({ q })) });
+});
+
+chatRoutes.post("/conversations", async (c) => {
+  const { title } = await body(c, conversationCreateSchema);
+  return c.json({ conversation: (await c.env.agent.services.conversations.create(title || "New conversation")) }, 201);
+});
+
+chatRoutes.get("/conversations/:id", async (c) => {
+  const s = c.env.agent.services;
+  const conversation = (await s.conversations.require(c.req.param("id")));
+  const { summary: _s, summary_upto: _u, ...rest } = conversation;
+  return c.json({
+    conversation: rest,
+    messages: (await s.pendingActions.withCurrentStatus((await s.conversations.messages(conversation.id)))),
+    streaming: c.env.agent.activeRuns.has(conversation.id),
+  });
+});
+
+chatRoutes.patch("/conversations/:id", async (c) => {
+  const { title } = await body(c, conversationUpdateSchema);
+  const { summary: _s, summary_upto: _u, ...rest } = (await c.env.agent.services.conversations.rename(c.req.param("id"), title));
+  return c.json({ conversation: rest });
+});
+
+chatRoutes.delete("/conversations/:id", async (c) => {
+  const id = c.req.param("id");
+  c.env.agent.activeRuns.get(id)?.abort();
+  (await c.env.agent.services.conversations.delete(id));
+  return c.json({ deleted: true });
+});
+
+chatRoutes.delete("/conversations", async (c) => {
+  await body(c, z.object({ confirm: z.literal("DELETE") }));
+  for (const controller of c.env.agent.activeRuns.values()) controller.abort();
+  const deleted = (await c.env.agent.services.conversations.deleteAll());
+  (await c.env.agent.services.activity.record("privacy.history_cleared", `Deleted ${deleted} conversation(s)`));
+  return c.json({ deleted });
+});
+
+/**
+ * Streams one agent turn as Server-Sent Events. The stream is produced inside the
+ * Durable Object and passes unbuffered through the Worker and the Pages Function.
+ */
+chatRoutes.post("/chat", async (c) => {
+  const input = await body(c, chatRequestSchema, 64 * 1024);
+  const agent = c.env.agent;
+  if (input.conversation_id && agent.activeRuns.has(input.conversation_id)) {
+    throw new AppError("CONFLICT", "A response is already being generated in this conversation.");
+  }
+  const controller = new AbortController();
+  // Claim the conversation now, before any await, so a concurrent request sees the conflict.
+  if (input.conversation_id) agent.activeRuns.set(input.conversation_id, controller);
+  const encoder = new TextEncoder();
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+  const writer = writable.getWriter();
+  let clientGone = false;
+
+  const send = async (event: ChatStreamEvent) => {
+    if (clientGone) return;
+    try {
+      await writer.write(encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`));
+    } catch {
+      // The browser disconnected: stop generating to save AI usage.
+      clientGone = true;
+      controller.abort();
+    }
+  };
+
+  const run = async () => {
+    let conversationId: string | undefined = input.conversation_id;
+    try {
+      await writer.write(encoder.encode(`: stream open\n\n`));
+      for await (const event of (await agent.runner()).chat({
+        conversationId: input.conversation_id,
+        message: input.message,
+        retry: input.retry,
+        signal: controller.signal,
+      })) {
+        if (event.type === "start") {
+          conversationId = event.conversation_id;
+          agent.activeRuns.set(conversationId, controller);
+        }
+        await send(event);
+      }
+    } catch (error) {
+      const appError = error instanceof AppError ? error : new AppError("INTERNAL_ERROR", "Something went wrong.");
+      if (!(error instanceof AppError)) console.error("Chat turn failed", error);
+      await send({ type: "error", code: appError.code, message: appError.message });
+    } finally {
+      if (conversationId && agent.activeRuns.get(conversationId) === controller) agent.activeRuns.delete(conversationId);
+      try {
+        await writer.close();
+      } catch {
+        /* already closed */
+      }
+    }
+  };
+  // The Durable Object stays alive while the response stream is open.
+  void run();
+
+  return new Response(readable, {
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-store, no-transform",
+      "x-accel-buffering": "no",
+    },
+  });
+});
+
+chatRoutes.post("/chat/cancel", async (c) => {
+  const { conversation_id } = await body(c, z.object({ conversation_id: z.string().min(1).max(64) }));
+  const controller = c.env.agent.activeRuns.get(conversation_id);
+  controller?.abort();
+  return c.json({ cancelled: !!controller });
+});
+
+/** Owner approval of a destructive action the agent proposed. The agent has no way to call this. */
+chatRoutes.post("/actions/:id/approve", async (c) => {
+  const s = c.env.agent.services;
+  const action = await runApprovedAction(ALL_TOOLS, { services: s, timezone: (await s.settings.get()).timezone, mode: "chat" }, c.req.param("id"));
+  return c.json({ action });
+});
+
+chatRoutes.post("/actions/:id/cancel", async (c) => {
+  const pending = c.env.agent.services.pendingActions;
+  const id = c.req.param("id");
+  if (!(await pending.get(id))) throw new NotFoundError("This action no longer exists.");
+  (await pending.resolve(id, "cancelled"));
+  return c.json({ action: (await pending.view(id)) });
+});
